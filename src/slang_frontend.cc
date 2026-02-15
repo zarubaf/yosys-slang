@@ -1298,7 +1298,46 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 				}
 			} else {
 				const auto &subr = *std::get<0>(call.subroutine);
-				if (procedural) {
+
+				// Handle DPI import functions by creating a placeholder cell
+				if (subr.flags.has(ast::MethodFlags::DPIImport)) {
+					// Create a $loom_dpi_call cell for the DPI function
+					// Use $__loom_dpi_call to indicate it's an internal cell that bypasses checks
+					int ret_width = (int) expr.type->getBitstreamWidth();
+					RTLIL::Cell *dpi_cell = netlist.canvas->addCell(netlist.new_id(), ID($__loom_dpi_call));
+
+					// Set the function name as an attribute
+					dpi_cell->set_string_attribute(ID(loom_dpi_func), std::string(subr.name));
+					// Mark as blackbox to skip internal cell checks
+					dpi_cell->set_bool_attribute(ID::blackbox, true);
+
+					// Evaluate and connect arguments
+					int arg_idx = 0;
+					int total_arg_width = 0;
+					std::vector<RTLIL::SigSpec> arg_sigs;
+					for (const auto *arg : call.arguments()) {
+						RTLIL::SigSpec arg_sig = (*this)(*arg);
+						arg_sigs.push_back(arg_sig);
+						total_arg_width += arg_sig.size();
+						arg_idx++;
+					}
+
+					// Pack all arguments into a single signal
+					RTLIL::SigSpec packed_args;
+					for (const auto &sig : arg_sigs) {
+						packed_args.append(sig);
+					}
+					dpi_cell->setPort(ID(ARGS), packed_args);
+					dpi_cell->setParam(ID(ARG_WIDTH), total_arg_width);
+					dpi_cell->setParam(ID(RET_WIDTH), ret_width);
+					dpi_cell->setParam(ID(NUM_ARGS), (int)call.arguments().size());
+
+					// Create output wire for return value
+					RTLIL::Wire *ret_wire = netlist.canvas->addWire(netlist.new_id(), ret_width);
+					dpi_cell->setPort(ID(RESULT), RTLIL::SigSpec(ret_wire));
+
+					ret = RTLIL::SigSpec(ret_wire);
+				} else if (procedural) {
 					ret = StatementExecutor(*procedural).handle_call(call);
 				} else {
 					require(subr, subr.subroutineKind == ast::SubroutineKind::Function);
