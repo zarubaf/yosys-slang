@@ -1291,6 +1291,25 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 					ret = netlist.CountOnes(sig, (int)call.type->getBitstreamWidth());
 				} else if (name == "$past") {
 					ret = handle_past(*this, call);
+				} else if (name == "$finish" || name == "$stop") {
+					// Create a $__loom_finish cell that will be transformed to hardware
+					require(expr, procedural != nullptr);
+					RTLIL::Cell *finish_cell = netlist.canvas->addCell(netlist.new_id(), ID($__loom_finish));
+					// Get exit code from optional argument (default 0)
+					int exit_code = 0;
+					if (!call.arguments().empty()) {
+						auto arg = call.arguments()[0];
+						auto sig = (*this)(*arg);
+						if (sig.is_fully_const()) {
+							exit_code = sig.as_const().as_int();
+						}
+					}
+					finish_cell->setParam(ID(EXIT_CODE), exit_code);
+					finish_cell->setParam(ID(IS_STOP), name == "$stop" ? 1 : 0);
+					// Set up trigger and enable like $check/$print cells
+					procedural->set_effects_trigger(finish_cell);
+					// No return value
+					ret = RTLIL::SigSpec();
 				} else {
 					require(expr, call.getSubroutineName() == "$signed" || call.getSubroutineName() == "$unsigned");
 					require(expr, call.arguments().size() == 1);
@@ -1303,7 +1322,7 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 				if (subr.flags.has(ast::MethodFlags::DPIImport)) {
 					// Create a $loom_dpi_call cell for the DPI function
 					// Use $__loom_dpi_call to indicate it's an internal cell that bypasses checks
-					int ret_width = (int) expr.type->getBitstreamWidth();
+					int ret_width = expr.type->isVoid() ? 0 : (int) expr.type->getBitstreamWidth();
 					RTLIL::Cell *dpi_cell = netlist.canvas->addCell(netlist.new_id(), ID($__loom_dpi_call));
 
 					// Set the function name as an attribute
@@ -1311,18 +1330,77 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 					// Mark as blackbox to skip internal cell checks
 					dpi_cell->set_bool_attribute(ID::blackbox, true);
 
+					// Collect formal argument info from the subroutine declaration
+					auto formal_args = subr.getArguments();
+					std::string arg_names_str, arg_types_str, arg_widths_str, arg_dirs_str;
+
 					// Evaluate and connect arguments
 					int arg_idx = 0;
 					int total_arg_width = 0;
 					std::vector<RTLIL::SigSpec> arg_sigs;
 					for (const auto *arg : call.arguments()) {
-						RTLIL::SigSpec arg_sig = (*this)(*arg);
-						arg_sigs.push_back(arg_sig);
-						total_arg_width += arg_sig.size();
+						const auto *formal = (arg_idx < (int)formal_args.size()) ? formal_args[arg_idx] : nullptr;
+						bool is_string = formal && formal->getType().isString();
+
+						if (arg_idx > 0) {
+							arg_names_str += ",";
+							arg_types_str += ",";
+							arg_widths_str += ",";
+							arg_dirs_str += ",";
+						}
+
+						if (formal) {
+							arg_names_str += std::string(formal->name);
+							arg_dirs_str += "input";
+						} else {
+							arg_names_str += "arg" + std::to_string(arg_idx);
+							arg_dirs_str += "input";
+						}
+
+						if (is_string) {
+							// String arguments: evaluate as constant, store as attribute
+							auto cv = arg->eval(this->const_);
+							std::string str_val;
+							if (cv.isString()) {
+								str_val = cv.str();
+							}
+							dpi_cell->set_string_attribute(
+								RTLIL::IdString("\\loom_dpi_string_arg_" + std::to_string(arg_idx)),
+								str_val);
+							arg_types_str += "string";
+							arg_widths_str += "0";
+							// Push empty signal (no hardware bits)
+						} else {
+							RTLIL::SigSpec arg_sig = (*this)(*arg);
+							arg_sigs.push_back(arg_sig);
+							total_arg_width += arg_sig.size();
+
+							if (formal) {
+								arg_types_str += formal->getType().toString();
+								arg_widths_str += std::to_string(arg_sig.size());
+							} else {
+								arg_types_str += "int";
+								arg_widths_str += std::to_string(arg_sig.size());
+							}
+						}
 						arg_idx++;
 					}
 
-					// Pack all arguments into a single signal
+					// Store argument metadata
+					dpi_cell->set_string_attribute(ID(loom_dpi_arg_names), arg_names_str);
+					dpi_cell->set_string_attribute(ID(loom_dpi_arg_types), arg_types_str);
+					dpi_cell->set_string_attribute(ID(loom_dpi_arg_widths), arg_widths_str);
+					dpi_cell->set_string_attribute(ID(loom_dpi_arg_dirs), arg_dirs_str);
+
+					// Store return type
+					if (ret_width > 0) {
+						dpi_cell->set_string_attribute(ID(loom_dpi_ret_type),
+							expr.type->toString());
+					} else {
+						dpi_cell->set_string_attribute(ID(loom_dpi_ret_type), "void");
+					}
+
+					// Pack all (non-string) arguments into a single signal
 					RTLIL::SigSpec packed_args;
 					for (const auto &sig : arg_sigs) {
 						packed_args.append(sig);
@@ -1332,11 +1410,21 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 					dpi_cell->setParam(ID(RET_WIDTH), ret_width);
 					dpi_cell->setParam(ID(NUM_ARGS), (int)call.arguments().size());
 
-					// Create output wire for return value
-					RTLIL::Wire *ret_wire = netlist.canvas->addWire(netlist.new_id(), ret_width);
-					dpi_cell->setPort(ID(RESULT), RTLIL::SigSpec(ret_wire));
+					// Create output wire for return value (or empty for void)
+					if (ret_width > 0) {
+						RTLIL::Wire *ret_wire = netlist.canvas->addWire(netlist.new_id(), ret_width);
+						dpi_cell->setPort(ID(RESULT), RTLIL::SigSpec(ret_wire));
+						ret = RTLIL::SigSpec(ret_wire);
+					} else {
+						dpi_cell->setPort(ID(RESULT), RTLIL::SigSpec());
+						ret = RTLIL::SigSpec();
+					}
 
-					ret = RTLIL::SigSpec(ret_wire);
+					// Attach procedural enable condition (like $print/$finish)
+					// so loom_instrument can derive the valid condition
+					if (procedural) {
+						procedural->set_effects_trigger(dpi_cell);
+					}
 				} else if (procedural) {
 					ret = StatementExecutor(*procedural).handle_call(call);
 				} else {
