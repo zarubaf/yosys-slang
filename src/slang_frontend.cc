@@ -1299,23 +1299,25 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 				} else if (name == "$past") {
 					ret = handle_past(*this, call);
 				} else if (name == "$finish" || name == "$stop") {
-					// Create a $__loom_finish cell that will be transformed to hardware
-					require(expr, procedural != nullptr);
-					RTLIL::Cell *finish_cell = netlist.canvas->addCell(netlist.new_id(), ID($__loom_finish));
-					// Get exit code from optional argument (default 0)
-					int exit_code = 0;
-					if (!call.arguments().empty()) {
-						auto arg = call.arguments()[0];
-						auto sig = (*this)(*arg);
-						if (sig.is_fully_const()) {
-							exit_code = sig.as_const().as_int();
+					if (netlist.settings.loom.value_or(false)) {
+						// Create a $__loom_finish cell that will be transformed to hardware
+						require(expr, procedural != nullptr);
+						RTLIL::Cell *finish_cell = netlist.canvas->addCell(netlist.new_id(), ID($__loom_finish));
+						// Get exit code from optional argument (default 0)
+						int exit_code = 0;
+						if (!call.arguments().empty()) {
+							auto arg = call.arguments()[0];
+							auto sig = (*this)(*arg);
+							if (sig.is_fully_const()) {
+								exit_code = sig.as_const().as_int();
+							}
 						}
+						finish_cell->setParam(ID(EXIT_CODE), exit_code);
+						finish_cell->setParam(ID(IS_STOP), name == "$stop" ? 1 : 0);
+						// Set up trigger and enable like $check/$print cells
+						procedural->set_effects_trigger(finish_cell);
 					}
-					finish_cell->setParam(ID(EXIT_CODE), exit_code);
-					finish_cell->setParam(ID(IS_STOP), name == "$stop" ? 1 : 0);
-					// Set up trigger and enable like $check/$print cells
-					procedural->set_effects_trigger(finish_cell);
-					// No return value
+					// No return value (void)
 					ret = RTLIL::SigSpec();
 				} else {
 					require(expr, call.getSubroutineName() == "$signed" || call.getSubroutineName() == "$unsigned");
