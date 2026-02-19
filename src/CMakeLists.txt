@@ -23,6 +23,8 @@ add_library(yosys-slang ${LIBRARY_TYPE}
     cases.h
     diag.cc
     diag.h
+    fsm_extract.cc
+    fsm_extract.h
     initial_eval.cc
     initial_eval.h
     memory.h

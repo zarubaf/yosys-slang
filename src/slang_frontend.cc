@@ -33,6 +33,7 @@
 #include "slang_frontend.h"
 #include "diag.h"
 #include "async_pattern.h"
+#include "fsm_extract.h"
 #include "variables.h"
 
 namespace slang_frontend {
@@ -1766,6 +1767,14 @@ public:
 			ProcessTiming timing;
 			timing.background_enable = netlist.LogicNot(prior_branch_taken);
 			timing.triggers.push_back({netlist.eval(clock.expr), clock.edge == ast::EdgeKind::PosEdge, &clock});
+
+			// Loom FSM extraction: if the sync body contains inner @(posedge clk)
+			// timing controls and we're in loom mode, extract a multi-cycle FSM
+			// instead of trying to lower as a single-cycle process.
+			if (netlist.settings.loom.value_or(false) && contains_inner_timing(sync_body)) {
+				emit_multicycle_fsm(netlist, symbol, clock, prologue_block, sync_body, timing);
+				return;
+			}
 
 			ProceduralContext sync_procedure(netlist, timing);
 			EnterAutomaticScopeGuard guard(sync_procedure.eval, prologue_block);

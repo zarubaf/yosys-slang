@@ -116,6 +116,8 @@ DiagCode InlinedInOutUnsupported(DiagSubsystem::Netlist, 1062);
 DiagCode PastGatingClockingUnsupported(DiagSubsystem::Netlist, 1063);
 DiagCode SystemFunctionRequireClockedBlock(DiagSubsystem::Netlist, 1064);
 DiagCode UnsupportedBitConversion(DiagSubsystem::Netlist, 1065);
+DiagCode FsmClockMismatch(DiagSubsystem::Netlist, 1066);
+DiagCode FsmUnsupportedPattern(DiagSubsystem::Netlist, 1067);
 
 DiagGroup unsynthesizable("unsynthesizable",
 		{IffUnsupported, GenericTimingUnsyn, BothEdgesUnsupported, ExpectingIfElseAload,
@@ -288,6 +290,12 @@ void setup_messages(slang::DiagnosticEngine &engine)
 
 	engine.setMessage(UnsupportedBitConversion, "value of type '{}' is unsupported for conversion to bits in this context");
 	engine.setSeverity(UnsupportedBitConversion, DiagnosticSeverity::Error);
+
+	engine.setMessage(FsmClockMismatch, "inner @(posedge) clock does not match outer clock of always block");
+	engine.setSeverity(FsmClockMismatch, DiagnosticSeverity::Error);
+
+	engine.setMessage(FsmUnsupportedPattern, "unsupported pattern in multi-cycle always block for FSM extraction");
+	engine.setSeverity(FsmUnsupportedPattern, DiagnosticSeverity::Error);
 
 	// clang-format on
 }
