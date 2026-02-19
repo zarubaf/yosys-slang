@@ -1328,9 +1328,8 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 				const auto &subr = *std::get<0>(call.subroutine);
 
 				// Handle DPI import functions by creating a placeholder cell
-				if (subr.flags.has(ast::MethodFlags::DPIImport)) {
-					// Create a $loom_dpi_call cell for the DPI function
-					// Use $__loom_dpi_call to indicate it's an internal cell that bypasses checks
+				if (netlist.settings.loom.value_or(false) && subr.flags.has(ast::MethodFlags::DPIImport)) {
+					// Create a $_loom_dpi_call cell for the DPI function
 					int ret_width = expr.type->isVoid() ? 0 : (int) expr.type->getBitstreamWidth();
 					RTLIL::Cell *dpi_cell = netlist.canvas->addCell(netlist.new_id(), ID($__loom_dpi_call));
 
@@ -1347,9 +1346,18 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 					int arg_idx = 0;
 					int total_arg_width = 0;
 					std::vector<RTLIL::SigSpec> arg_sigs;
+
+					// Track output open array assignments for post-processing
+					struct PendingOutputAssign {
+						const ast::AssignmentExpression *assign;
+						RTLIL::SigSpec sig;
+					};
+					std::vector<PendingOutputAssign> pending_output_assigns;
+
 					for (const auto *arg : call.arguments()) {
 						const auto *formal = (arg_idx < (int)formal_args.size()) ? formal_args[arg_idx] : nullptr;
 						bool is_string = formal && formal->getType().isString();
+						bool is_open_array = formal && !formal->getType().isFixedSize();
 
 						if (arg_idx > 0) {
 							arg_names_str += ",";
@@ -1360,10 +1368,8 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 
 						if (formal) {
 							arg_names_str += std::string(formal->name);
-							arg_dirs_str += "input";
 						} else {
 							arg_names_str += "arg" + std::to_string(arg_idx);
-							arg_dirs_str += "input";
 						}
 
 						if (is_string) {
@@ -1386,8 +1392,26 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 								str_val);
 							arg_types_str += "string";
 							arg_widths_str += "0";
+							arg_dirs_str += "input";
 							// Push empty signal (no hardware bits)
+						} else if (is_open_array && arg->kind == ast::ExpressionKind::Assignment) {
+							// Output open array: the arg is an AssignmentExpression whose
+							// LHS is the local fixed-size variable. We can't evaluate the
+							// full expression (open array type has no fixed bitstream width),
+							// so extract the LHS to determine the width and create an
+							// output wire to be assigned back after the cell is created.
+							auto &assign_expr = arg->as<ast::AssignmentExpression>();
+							int width = assign_expr.left().type->getBitstreamWidth();
+							RTLIL::Wire *out_wire = netlist.canvas->addWire(netlist.new_id(), width);
+							arg_sigs.push_back(RTLIL::SigSpec(out_wire));
+							total_arg_width += width;
+							arg_types_str += formal->getType().toString();
+							arg_widths_str += std::to_string(width);
+							arg_dirs_str += "output";
+							pending_output_assigns.push_back({&assign_expr, RTLIL::SigSpec(out_wire)});
 						} else {
+							// Regular argument (including input open arrays â the actual
+							// expression's type is the local variable's fixed-size type)
 							RTLIL::SigSpec arg_sig = (*this)(*arg);
 							arg_sigs.push_back(arg_sig);
 							total_arg_width += arg_sig.size();
@@ -1399,6 +1423,7 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 								arg_types_str += "int";
 								arg_widths_str += std::to_string(arg_sig.size());
 							}
+							arg_dirs_str += "input";
 						}
 						arg_idx++;
 					}
@@ -1441,6 +1466,13 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 					// so loom_instrument can derive the valid condition
 					if (procedural) {
 						procedural->set_effects_trigger(dpi_cell);
+					}
+
+					// Write back output open array arguments to their local variables
+					if (procedural) {
+						for (auto &pending : pending_output_assigns) {
+							procedural->assign_rvalue(*pending.assign, pending.sig);
+						}
 					}
 				} else if (procedural) {
 					ret = StatementExecutor(*procedural).handle_call(call);
