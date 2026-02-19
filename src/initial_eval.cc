@@ -681,6 +681,13 @@ ER EvalVisitor::visit(const ExpressionStatement &stmt)
 			}
 			return ER::Success;
 		}
+		// DPI import calls cannot be evaluated at compile time; skip them.
+		if (!call.isSystemCall()) {
+			const auto &subr = *std::get<0>(call.subroutine);
+			if (subr.flags.has(MethodFlags::DPIImport)) {
+				return ER::Success;
+			}
+		}
 	}
 	return expr.eval(context) ? ER::Success : ER::Fail;
 }

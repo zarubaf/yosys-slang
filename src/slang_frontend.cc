@@ -1397,11 +1397,10 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 							arg_widths_str += "0";
 							arg_dirs_str += "input";
 							// Push empty signal (no hardware bits)
-						} else if (is_open_array && arg->kind == ast::ExpressionKind::Assignment) {
-							// Output open array: the arg is an AssignmentExpression whose
-							// LHS is the local fixed-size variable. We can't evaluate the
-							// full expression (open array type has no fixed bitstream width),
-							// so extract the LHS to determine the width and create an
+						} else if (arg->kind == ast::ExpressionKind::Assignment) {
+							// Output array (open or fixed-size): the arg is an
+							// AssignmentExpression whose LHS is the local variable.
+							// Extract the LHS to determine the width and create an
 							// output wire to be assigned back after the cell is created.
 							auto &assign_expr = arg->as<ast::AssignmentExpression>();
 							int width = assign_expr.left().type->getBitstreamWidth();
@@ -3408,6 +3407,15 @@ struct SlangFrontend : Frontend {
 		if (!driver.processOptions())
 			log_cmd_error("Bad command\n");
 		catch_forbidden_options(driver);
+
+		// In loom mode, downgrade DPI signature mismatch to a warning.
+		// Fixed-size array DPI imports may differ in array length across
+		// modules (e.g., multisim_server_pull with different DATA_WIDTH),
+		// but the C-side signature is identical (pointer).
+		if (settings.loom.value_or(false)) {
+			driver.diagEngine.setSeverity(slang::diag::DPISignatureMismatch,
+			                              slang::DiagnosticSeverity::Warning);
+		}
 
 		try {
 			if (!driver.parseAllSources())
