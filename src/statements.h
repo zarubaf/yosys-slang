@@ -242,9 +242,38 @@ public:
 		auto subroutine = std::get<0>(call.subroutine);
 		auto arg_symbols = subroutine->getArguments();
 
+		bool loom_mode = netlist.settings.loom.value_or(false);
+
+		// In Loom mode, propagate string constants from actual arguments
+		// to formal parameters so DPI handlers can resolve them.
+		if (loom_mode) {
+			for (int i = 0; i < (int)arg_symbols.size(); i++) {
+				if (!arg_symbols[i]->getType().isString())
+					continue;
+				const ast::Expression *arg = call.arguments()[i];
+				// Try compile-time evaluation first
+				auto cv = arg->eval(eval.const_);
+				if (cv.isString()) {
+					netlist.loom_string_constants[arg_symbols[i]] = cv.str();
+				} else if (arg->kind == ast::ExpressionKind::NamedValue) {
+					// Look up in existing map (e.g. module port -> formal)
+					auto &sym = arg->as<ast::NamedValueExpression>().symbol;
+					auto it = netlist.loom_string_constants.find(&sym);
+					if (it != netlist.loom_string_constants.end())
+						netlist.loom_string_constants[arg_symbols[i]] = it->second;
+				}
+			}
+		}
+
 		std::vector<RTLIL::SigSpec> arg_in, arg_out;
 
 		for (int i = 0; i < (int)arg_symbols.size(); i++) {
+			// Skip string-typed arguments — no hardware representation
+			if (loom_mode && arg_symbols[i]->getType().isString()) {
+				arg_in.push_back({});
+				continue;
+			}
+
 			const ast::Expression *arg = call.arguments()[i];
 			auto dir = arg_symbols[i]->direction;
 
@@ -263,12 +292,18 @@ public:
 				if (ast::VariableSymbol::isKind(member.kind)) {
 					auto &var = member.as<ast::VariableSymbol>();
 
+					// Skip string-typed formal arguments — no hardware representation
+					if (loom_mode && var.getType().isString())
+						continue;
+
 					if (var.kind == ast::SymbolKind::FormalArgument ||
 							var.flags.has(ast::VariableFlags::CompilerGenerated))
 						var.visit(*this);
 				}
 
 			for (int i = 0; i < (int)arg_symbols.size(); i++) {
+				if (loom_mode && arg_symbols[i]->getType().isString())
+					continue;
 				auto dir = arg_symbols[i]->direction;
 				if (dir == ast::ArgumentDirection::In || dir == ast::ArgumentDirection::InOut)
 					context.do_simple_assign(loc, eval.variable(*arg_symbols[i]), arg_in[i], true);
@@ -281,6 +316,10 @@ public:
 			}
 
 			for (int i = 0; i < (int)arg_symbols.size(); i++) {
+				if (loom_mode && arg_symbols[i]->getType().isString()) {
+					arg_out.push_back({});
+					continue;
+				}
 				auto dir = arg_symbols[i]->direction;
 				if (dir == ast::ArgumentDirection::Out || dir == ast::ArgumentDirection::InOut)
 					arg_out.push_back(eval(*arg_symbols[i]));
@@ -293,6 +332,8 @@ public:
 		}
 
 		for (int i = 0; i < (int)arg_symbols.size(); i++) {
+			if (loom_mode && arg_symbols[i]->getType().isString())
+				continue;
 			const ast::Expression *arg = call.arguments()[i];
 			auto dir = arg_symbols[i]->direction;
 

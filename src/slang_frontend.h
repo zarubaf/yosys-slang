@@ -431,6 +431,7 @@ struct SynthesisSettings {
 	std::optional<bool> no_default_translate_off;
 	std::optional<bool> allow_dual_edge_ff;
 	std::optional<bool> no_synthesis_define;
+	std::optional<bool> loom;
 	// pass std::less<> to enable transparent lookup
 	std::set<std::string, std::less<>> blackboxed_modules;
 	bool disable_instance_caching = false;
@@ -496,6 +497,12 @@ struct NetlistContext : RTLILBuilder, public DiagnosticIssuer {
 	// Flag to disable elaboration; we set this when `scopes_remap` is
 	// incomplete due to prior errors
 	bool disabled = false;
+
+	// In Loom mode, tracks compile-time string constants for symbols
+	// (string-typed port variables, function formal parameters).
+	// Strings can't be represented as hardware signals, so we propagate
+	// their values through this map for DPI argument resolution.
+	Yosys::dict<const ast::Symbol *, std::string YS_HASH_PTR_OPS> loom_string_constants;
 
 	NetlistContext(RTLIL::Design *design,
 		SynthesisSettings &settings,

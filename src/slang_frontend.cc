@@ -75,6 +75,8 @@ void SynthesisSettings::addOptions(slang::CommandLine &cmdLine) {
 				"Allow synthesis of dual-edge flip-flops (@(edge))");
 	cmdLine.add("--no-synthesis-define", no_synthesis_define,
 				"Don't add implicit -D SYNTHESIS");
+	cmdLine.add("--loom", loom,
+				"Enable Loom FPGA emulation support (DPI bridging, $finish handling)");
 	cmdLine.add("--blackboxed-module",
 				[this](std::string_view value) {
 					blackboxed_modules.insert(std::string(value));
@@ -935,6 +937,11 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 
 	ast_invariant(expr, expr.kind != ast::ExpressionKind::Streaming);
 	if (!(expr.type->isFixedSize() || expr.type->isVoid())) {
+		// In Loom mode, allow string expressions to pass through as empty
+		// signals. Their compile-time values are tracked in loom_string_constants
+		// and captured by the DPI handler.
+		if (netlist.settings.loom.value_or(false) && expr.type->isString())
+			return RTLIL::SigSpec();
 		auto &diag = netlist.add_diag(diag::FixedSizeRequired, expr.sourceRange);
 		diag << expr.type->toString();
 		goto error;
@@ -1358,11 +1365,19 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 						}
 
 						if (is_string) {
-							// String arguments: evaluate as constant, store as attribute
+							// String arguments: evaluate as constant, store as attribute.
+							// First try compile-time eval, then fall back to the
+							// loom_string_constants map (for strings propagated through
+							// function inlining / port dissolution).
 							auto cv = arg->eval(this->const_);
 							std::string str_val;
 							if (cv.isString()) {
 								str_val = cv.str();
+							} else if (arg->kind == ast::ExpressionKind::NamedValue) {
+								auto &sym = arg->as<ast::NamedValueExpression>().symbol;
+								auto it = netlist.loom_string_constants.find(&sym);
+								if (it != netlist.loom_string_constants.end())
+									str_val = it->second;
 							}
 							dpi_cell->set_string_attribute(
 								RTLIL::IdString("\\loom_dpi_string_arg_" + std::to_string(arg_idx)),
@@ -1995,6 +2010,21 @@ public:
 				if (conn->port.kind == ast::SymbolKind::InterfacePort ||
 						conn->port.kind == ast::SymbolKind::ModportPort)
 					continue;
+
+				// In Loom mode, skip string-typed port connections — strings
+				// have no hardware representation. Store the compile-time string
+				// value so DPI handlers can retrieve it.
+				if (netlist.settings.loom.value_or(false) &&
+						conn->port.kind == ast::SymbolKind::Port &&
+						!conn->port.as<ast::PortSymbol>().getType().isFixedSize() &&
+						conn->port.as<ast::PortSymbol>().getType().isString()) {
+					auto &port = conn->port.as<ast::PortSymbol>();
+					auto cv = expr.eval(netlist.eval.const_);
+					if (cv.isString() && port.internalSymbol) {
+						netlist.loom_string_constants[port.internalSymbol] = cv.str();
+					}
+					continue;
+				}
 
 				RTLIL::SigSpec signal;
 				if (expr.kind == ast::ExpressionKind::Assignment) {
