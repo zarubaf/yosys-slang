@@ -35,6 +35,8 @@
 #include "async_pattern.h"
 #include "fsm_extract.h"
 #include "variables.h"
+#include "slang/ast/statements/LoopStatements.h"
+#include "slang/ast/expressions/OperatorExpressions.h"
 
 namespace slang_frontend {
 
@@ -1883,9 +1885,131 @@ public:
 		}
 	}
 
-	void handle_initial_process(const ast::ProceduralBlockSymbol &, const ast::Statement &body) {
+	// Detect the "tbx clkgen" pattern: initial begin clk = 0; forever #N clk = ~clk; end
+	// Returns the clock symbol if found, nullptr otherwise.
+	static const ast::Symbol *detect_tbx_clkgen(const ast::Statement &body) {
+		// Unwrap block/list to get the statements
+		const ast::Statement *s = &body;
+		while (s->kind == ast::StatementKind::Block)
+			s = &s->as<ast::BlockStatement>().body;
+
+		// Find the forever loop (may be preceded by a constant assignment)
+		const ast::ForeverLoopStatement *forever_loop = nullptr;
+		if (s->kind == ast::StatementKind::List) {
+			for (auto child : s->as<ast::StatementList>().list) {
+				if (child->kind == ast::StatementKind::ForeverLoop)
+					forever_loop = &child->as<ast::ForeverLoopStatement>();
+			}
+		} else if (s->kind == ast::StatementKind::ForeverLoop) {
+			forever_loop = &s->as<ast::ForeverLoopStatement>();
+		}
+
+		if (!forever_loop)
+			return nullptr;
+
+		// The forever body should be a timed statement: #N <assignment>
+		const ast::Statement *fb = &forever_loop->body;
+		while (fb->kind == ast::StatementKind::Block)
+			fb = &fb->as<ast::BlockStatement>().body;
+		if (fb->kind != ast::StatementKind::Timed)
+			return nullptr;
+
+		auto &timed = fb->as<ast::TimedStatement>();
+		// The timed body should be an assignment: clk = ~clk or clk <= ~clk
+		const ast::Statement *assign_stmt = &timed.stmt;
+		while (assign_stmt->kind == ast::StatementKind::Block)
+			assign_stmt = &assign_stmt->as<ast::BlockStatement>().body;
+		if (assign_stmt->kind != ast::StatementKind::ExpressionStatement)
+			return nullptr;
+
+		auto &expr = assign_stmt->as<ast::ExpressionStatement>().expr;
+		if (expr.kind != ast::ExpressionKind::Assignment)
+			return nullptr;
+
+		auto &assign = expr.as<ast::AssignmentExpression>();
+		// LHS should be a named variable
+		if (assign.left().kind != ast::ExpressionKind::NamedValue)
+			return nullptr;
+
+		return &assign.left().as<ast::NamedValueExpression>().symbol;
+	}
+
+	// Check if source text near a location contains a comment string.
+	static bool source_has_comment(const ast::Statement &stmt, const char *comment) {
+		if (!global_sourcemgr)
+			return false;
+		auto sr = stmt.sourceRange;
+		auto text = global_sourcemgr->getSourceText(sr.start().buffer());
+		if (text.empty())
+			return false;
+		// Search backwards from the statement start for the comment
+		// (up to 200 chars, covering the line above)
+		size_t start = sr.start().offset();
+		size_t search_start = (start > 200) ? start - 200 : 0;
+		auto region = text.substr(search_start, start - search_start);
+		return region.find(comment) != std::string_view::npos;
+	}
+
+	void handle_initial_process(const ast::ProceduralBlockSymbol &symbol, const ast::Statement &body) {
 		if (settings.ignore_initial.value_or(false))
 			return;
+
+		// In loom mode, detect "tbx clkgen" pattern and promote to input port
+		if (settings.loom.value_or(false)) {
+			if (auto *clk_sym = detect_tbx_clkgen(body)) {
+				// Require the "tbx clkgen" comment annotation
+				if (!source_has_comment(body, "tbx clkgen")) {
+					log_error("Loom: detected forever clock pattern (signal '%s') but "
+					          "missing '// tbx clkgen' comment annotation.\n"
+					          "Add '// tbx clkgen' before the initial block to confirm "
+					          "this is a clock generator to be promoted to an input port.\n",
+					          std::string(clk_sym->name).c_str());
+				}
+
+				// Promote the clock signal to an input port
+				RTLIL::Wire *w = netlist.wire(*clk_sym);
+				if (w && !w->port_input) {
+					log("Loom: detected tbx clkgen, promoting '%s' to input port\n",
+					    w->name.c_str());
+					w->port_input = true;
+					netlist.canvas->fixup_ports();
+					// Store the clock name so emu_top can auto-detect it
+					netlist.canvas->set_string_attribute(
+						Yosys::RTLIL::IdString("\\loom_tbx_clk"),
+						Yosys::RTLIL::unescape_id(w->name));
+				}
+				return; // Skip the initial block
+			}
+
+			// Reject initial blocks with unsynthesizable constructs.
+			if (contains_inner_timing(body))
+				log_error("Unsynthesizable initial block: contains timing controls (@posedge / #delay).\n");
+
+			{
+				std::function<void(const ast::Statement &)> check =
+					[&](const ast::Statement &s) {
+					switch (s.kind) {
+					case ast::StatementKind::Wait:
+					case ast::StatementKind::WaitFork:
+					case ast::StatementKind::WaitOrder:
+						log_error("Unsynthesizable initial block: contains wait statement.\n");
+					case ast::StatementKind::ForeverLoop:
+						log_error("Unsynthesizable initial block: contains forever loop.\n"
+						          "If this is a clock generator, add '// tbx clkgen' before the initial block.\n");
+					case ast::StatementKind::Block:
+						check(s.as<ast::BlockStatement>().body);
+						return;
+					case ast::StatementKind::List:
+						for (auto child : s.as<ast::StatementList>().list)
+							check(*child);
+						return;
+					default:
+						return;
+					}
+				};
+				check(body);
+			}
+		}
 
 		auto result = body.visit(initial_eval);
 		if (result != ast::Statement::EvalResult::Success)
