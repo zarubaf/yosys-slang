@@ -2270,6 +2270,24 @@ public:
 		}
 
 		if (netlist.should_dissolve(sym)) {
+			// In Loom mode, populate string port constants BEFORE visiting
+			// the body so that DPI handlers inside can resolve string arguments
+			// (e.g., server_name parameter passed to multisim_server_pull).
+			if (netlist.settings.loom.value_or(false)) {
+				for (auto *conn : sym.getPortConnections()) {
+					if (!conn->getExpression())
+						continue;
+					if (conn->port.kind != ast::SymbolKind::Port)
+						continue;
+					auto &port = conn->port.as<ast::PortSymbol>();
+					if (!port.getType().isString() || port.getType().isFixedSize())
+						continue;
+					auto cv = conn->getExpression()->eval(netlist.eval.const_);
+					if (cv.isString() && port.internalSymbol)
+						netlist.loom_string_constants[port.internalSymbol] = cv.str();
+				}
+			}
+
 			sym.body.visit(*this);
 
 			for (auto *conn : sym.getPortConnections()) {
@@ -2284,17 +2302,11 @@ public:
 					continue;
 
 				// In Loom mode, skip string-typed port connections — strings
-				// have no hardware representation. Store the compile-time string
-				// value so DPI handlers can retrieve it.
+				// have no hardware representation (already stored above).
 				if (netlist.settings.loom.value_or(false) &&
 						conn->port.kind == ast::SymbolKind::Port &&
 						!conn->port.as<ast::PortSymbol>().getType().isFixedSize() &&
 						conn->port.as<ast::PortSymbol>().getType().isString()) {
-					auto &port = conn->port.as<ast::PortSymbol>();
-					auto cv = expr.eval(netlist.eval.const_);
-					if (cv.isString() && port.internalSymbol) {
-						netlist.loom_string_constants[port.internalSymbol] = cv.str();
-					}
 					continue;
 				}
 
@@ -2603,8 +2615,27 @@ public:
 			}
 			initial_eval.context.createLocal(&symbol, initval);
 		}, [&](auto& visitor, const ast::InstanceSymbol& sym) {
-			if (netlist.should_dissolve(sym))
+			if (netlist.should_dissolve(sym)) {
 				visitor.visitDefault(sym);
+				// Populate input port values from connection expressions
+				// so that initial blocks in the dissolved body see the
+				// correct values (e.g., string parameters like server names).
+				for (auto *conn : sym.getPortConnections()) {
+					if (!conn->getExpression()) continue;
+					if (conn->port.kind != ast::SymbolKind::Port) continue;
+					auto &port = conn->port.as<ast::PortSymbol>();
+					if (port.direction != ast::ArgumentDirection::In) continue;
+					if (!port.internalSymbol) continue;
+					if (!ast::ValueSymbol::isKind(port.internalSymbol->kind)) continue;
+					auto &internal = port.internalSymbol->as<ast::ValueSymbol>();
+					auto cv = conn->getExpression()->eval(initial_eval.context);
+					if (!cv.bad()) {
+						auto *storage = initial_eval.context.findLocal(&internal);
+						if (storage)
+							*storage = cv;
+					}
+				}
+			}
 		}, [&](auto& visitor, const ast::GenerateBlockSymbol& sym) {
 			/* stop at uninstantiated generate blocks */
 			if (sym.isUninstantiated)
@@ -2617,6 +2648,15 @@ public:
 	{
 		body.visit(ast::makeVisitor([&](auto&, const ast::VariableSymbol &sym) {
 			if (sym.getType().isFixedSize() && sym.lifetime == ast::VariableLifetime::Static) {
+				// Skip input ports of dissolved instances — their value comes
+				// from the port connection, not the type default.
+				for (const auto *backref = sym.getFirstPortBackref();
+						backref; backref = backref->getNextBackreference()) {
+					if (backref->port->internalSymbol == &sym &&
+							backref->port->direction == ast::ArgumentDirection::In)
+						return;
+				}
+
 				auto storage = initial_eval.context.findLocal(&sym);
 				log_assert(storage);
 				auto converted = netlist.convert_const(*storage, sym.location);
@@ -3162,6 +3202,17 @@ bool NetlistContext::should_dissolve(const ast::InstanceSymbol &sym, slang::Diag
 	// interfaces are always dissolved
 	if (sym.isInterface())
 		return true;
+
+	// In Loom mode, dissolve modules with string-typed ports.
+	// Strings have no hardware representation — their compile-time values
+	// can only be propagated through loom_string_constants during dissolution.
+	if (settings.loom.value_or(false) && sym.isModule()) {
+		for (auto *conn : sym.getPortConnections()) {
+			if (conn->port.kind == ast::SymbolKind::Port &&
+					conn->port.as<ast::PortSymbol>().getType().isString())
+				return true;
+		}
+	}
 
 	// the rest depends on the hierarchy mode
 	switch (settings.hierarchy_mode()) {

@@ -502,7 +502,7 @@ struct NetlistContext : RTLILBuilder, public DiagnosticIssuer {
 	// (string-typed port variables, function formal parameters).
 	// Strings can't be represented as hardware signals, so we propagate
 	// their values through this map for DPI argument resolution.
-	Yosys::dict<const ast::Symbol *, std::string YS_HASH_PTR_OPS> loom_string_constants;
+	std::map<const ast::Symbol *, std::string> loom_string_constants;
 
 	NetlistContext(RTLIL::Design *design,
 		SynthesisSettings &settings,
