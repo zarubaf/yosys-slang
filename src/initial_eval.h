@@ -9,6 +9,15 @@ public:
 	slang::ast::EvalContext context;
 	EvalVisitor(slang::ast::Compilation *compilation, bool ignore_timing = false);
 
+	// Captured void DPI calls from initial blocks (for Loom)
+	struct InitialDpiCall {
+		std::string func_name;
+		std::vector<slang::ConstantValue> args;
+		const slang::ast::CallExpression *call_expr;
+	};
+	std::vector<InitialDpiCall> initial_dpi_calls;
+	bool capture_dpi_calls = false;  // set by frontend in loom mode
+
 	using ER = slang::ast::Statement::EvalResult;
 
 	// for creating and initializing local variables

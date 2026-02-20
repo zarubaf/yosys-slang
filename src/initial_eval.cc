@@ -681,10 +681,25 @@ ER EvalVisitor::visit(const ExpressionStatement &stmt)
 			}
 			return ER::Success;
 		}
-		// DPI import calls cannot be evaluated at compile time; skip them.
+		// DPI import calls: in Loom mode, capture void calls with constant args.
+		// Otherwise, silently skip them (cannot evaluate at compile time).
 		if (!call.isSystemCall()) {
 			const auto &subr = *std::get<0>(call.subroutine);
 			if (subr.flags.has(MethodFlags::DPIImport)) {
+				if (capture_dpi_calls && subr.getReturnType().isVoid()) {
+					InitialDpiCall dpi_info;
+					dpi_info.func_name = std::string(subr.name);
+					dpi_info.call_expr = &call;
+					for (auto arg_expr : call.arguments()) {
+						auto cv = arg_expr->eval(context);
+						if (cv.bad()) {
+							// Non-constant argument: fall back to skipping
+							return ER::Success;
+						}
+						dpi_info.args.push_back(cv);
+					}
+					initial_dpi_calls.push_back(std::move(dpi_info));
+				}
 				return ER::Success;
 			}
 		}

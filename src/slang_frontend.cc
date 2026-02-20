@@ -2012,12 +2012,114 @@ public:
 				};
 				check(body);
 			}
+
+			// Check for unsupported pattern: DPI call with used result in initial block
+			{
+				std::function<bool(const ast::Expression &)> has_dpi_call =
+					[&](const ast::Expression &e) -> bool {
+					if (e.kind == ast::ExpressionKind::Call) {
+						auto &call = e.as<ast::CallExpression>();
+						if (!call.isSystemCall()) {
+							auto &subr = *std::get<0>(call.subroutine);
+							if (subr.flags.has(ast::MethodFlags::DPIImport))
+								return true;
+						}
+					}
+					return false;
+				};
+
+				std::function<void(const ast::Statement &)> check_dpi_result =
+					[&](const ast::Statement &s) {
+					if (s.kind == ast::StatementKind::ExpressionStatement) {
+						auto &es = s.as<ast::ExpressionStatement>();
+						if (es.expr.kind == ast::ExpressionKind::Assignment) {
+							auto &assign = es.expr.as<ast::AssignmentExpression>();
+							if (has_dpi_call(assign.right()))
+								log_error("Loom: DPI call with used result in initial block is not supported.\n"
+								          "Cast to void if the result is not needed, or move to a reset block\n"
+								          "(`if (!rst_ni) reg <= dpi_func(...)`) for scan-based injection.\n");
+						}
+					}
+					if (s.kind == ast::StatementKind::Block)
+						check_dpi_result(s.as<ast::BlockStatement>().body);
+					if (s.kind == ast::StatementKind::List)
+						for (auto child : s.as<ast::StatementList>().list)
+							check_dpi_result(*child);
+				};
+				check_dpi_result(body);
+			}
+
+			// Enable DPI call capture for void initial DPI calls
+			initial_eval.capture_dpi_calls = true;
 		}
 
 		auto result = body.visit(initial_eval);
 		if (result != ast::Statement::EvalResult::Success)
 			initial_eval.context.addDiag(diag::NoteIgnoreInitial,
 										 slang::SourceLocation::NoLocation);
+
+		// In loom mode: create $__loom_dpi_call cells for captured void DPI calls
+		if (settings.loom.value_or(false) && !initial_eval.initial_dpi_calls.empty()) {
+			for (auto &dpi_info : initial_eval.initial_dpi_calls) {
+				auto &call = *dpi_info.call_expr;
+				auto &subr = *std::get<0>(call.subroutine);
+				auto formal_args = subr.getArguments();
+
+				RTLIL::Cell *dpi_cell = netlist.canvas->addCell(netlist.new_id(), ID($__loom_dpi_call));
+				dpi_cell->set_string_attribute(ID(loom_dpi_func), dpi_info.func_name);
+				dpi_cell->set_bool_attribute(ID::blackbox, true);
+				dpi_cell->set_bool_attribute(ID(loom_dpi_initial), true);
+				dpi_cell->set_bool_attribute(ID(keep), true);
+
+				RTLIL::SigSpec packed_args;
+				std::string arg_names, arg_types, arg_widths, arg_dirs;
+				int arg_idx = 0;
+				for (auto &cv : dpi_info.args) {
+					auto *formal = (arg_idx < (int)formal_args.size()) ? formal_args[arg_idx] : nullptr;
+					if (arg_idx > 0) { arg_names += ","; arg_types += ","; arg_widths += ","; arg_dirs += ","; }
+
+					if (formal) arg_names += std::string(formal->name);
+					else arg_names += "arg" + std::to_string(arg_idx);
+
+					bool is_string = formal && formal->getType().isString();
+					if (is_string) {
+						dpi_cell->set_string_attribute(
+							RTLIL::IdString("\\loom_dpi_string_arg_" + std::to_string(arg_idx)),
+							cv.str());
+						arg_types += "string";
+						arg_widths += "0";
+					} else {
+						int width = formal->getType().getBitstreamWidth();
+						auto sv_int = cv.integer();
+						RTLIL::Const const_val(RTLIL::State::S0, width);
+						for (int i = 0; i < width; i++) {
+							auto bit_val = sv_int[i];
+							const_val.bits().at(i) = (bool)bit_val ? RTLIL::S1 : RTLIL::S0;
+						}
+						packed_args.append(RTLIL::SigSpec(const_val));
+						arg_types += formal->getType().toString();
+						arg_widths += std::to_string(width);
+					}
+					arg_dirs += "input";
+					arg_idx++;
+				}
+
+				dpi_cell->set_string_attribute(ID(loom_dpi_arg_names), arg_names);
+				dpi_cell->set_string_attribute(ID(loom_dpi_arg_types), arg_types);
+				dpi_cell->set_string_attribute(ID(loom_dpi_arg_widths), arg_widths);
+				dpi_cell->set_string_attribute(ID(loom_dpi_arg_dirs), arg_dirs);
+				dpi_cell->setPort(ID(ARGS), packed_args);
+				dpi_cell->setParam(ID(ARG_WIDTH), Yosys::GetSize(packed_args));
+				dpi_cell->setParam(ID(RET_WIDTH), 0);
+				dpi_cell->setParam(ID(NUM_ARGS), (int)dpi_info.args.size());
+				dpi_cell->setPort(ID(RESULT), RTLIL::SigSpec());
+				dpi_cell->set_string_attribute(ID(loom_dpi_ret_type), "void");
+
+				log("Loom: captured initial DPI call: %s (%d args)\n",
+				    dpi_info.func_name.c_str(), arg_idx);
+			}
+			initial_eval.initial_dpi_calls.clear();
+		}
 	}
 
 	void handle(const ast::ProceduralBlockSymbol &symbol)
