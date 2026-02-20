@@ -883,6 +883,10 @@ void handle_display(ProceduralContext &context, const ast::CallExpression &call)
 	NetlistContext &netlist = context.netlist;
 	auto cell = netlist.canvas->addCell(netlist.new_id(), ID($print));
 	transfer_attrs(context.netlist, call, cell);
+	// In loom mode, $print cells are later converted to DPI bridge calls
+	// by loom_instrument. Mark as keep so opt_clean doesn't remove them.
+	if (netlist.settings.loom.value_or(false))
+		cell->set_bool_attribute(ID::keep, true);
 	context.set_effects_trigger(cell);
 	cell->parameters[ID::PRIORITY] = --context.effects_priority;
 	std::vector<Yosys::VerilogFmtArg> fmt_args;
