@@ -2978,6 +2978,25 @@ RTLIL::Wire *NetlistContext::add_wire(const ast::ValueSymbol &symbol)
 	auto w = canvas->addWire(id(symbol), type.getBitstreamWidth());
 	w->set_string_attribute(ID::hdlname, hdlname(symbol));
 
+	// Attach enum member metadata for scan chain display
+	auto &canonical = type.getCanonicalType();
+	if (canonical.isEnum()) {
+		auto &enumType = canonical.as<ast::EnumType>();
+		std::string members;
+		for (const auto &val : enumType.values()) {
+			if (!members.empty()) members += ',';
+			members += std::string(val.name);
+			members += ':';
+			auto cv = val.getValue();
+			if (cv.isInteger()) {
+				auto opt = cv.integer().as<uint64_t>();
+				members += std::to_string(opt.value_or(0));
+			}
+		}
+		if (!members.empty())
+			w->set_string_attribute(ID(loom_enum_members), members);
+	}
+
 	if (type.kind == ast::SymbolKind::PackedArrayType &&
 			type.as<ast::PackedArrayType>().elementType.isScalar()) {
 		auto range = type.getFixedRange();
