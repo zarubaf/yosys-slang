@@ -2120,6 +2120,27 @@ public:
 			}
 			initial_eval.initial_dpi_calls.clear();
 		}
+
+		// In loom mode: store $readmemh/$readmemb metadata as wire attributes
+		// so mem_shadow can propagate them to the protobuf map.
+		// File parsing happens at runtime in loomx, not here.
+		if (settings.loom.value_or(false) && !initial_eval.readmem_calls.empty()) {
+			for (auto &rm : initial_eval.readmem_calls) {
+				// Store readmem metadata as module attributes.
+				// Memory variables don't have RTLIL wires (they become RTLIL::Memory),
+				// so we use module-level attributes keyed by the hierarchical memory name.
+				RTLIL::IdString mem_id = netlist.id(*rm.mem_symbol);
+				std::string key = RTLIL::unescape_id(mem_id);
+				netlist.canvas->set_string_attribute(
+					RTLIL::IdString("\\loom_readmem_file_" + key), rm.filename);
+				netlist.canvas->set_bool_attribute(
+					RTLIL::IdString("\\loom_readmem_hex_" + key), rm.is_hex);
+				log("Loom: captured %s(\"%s\", %s)\n",
+				    rm.is_hex ? "$readmemh" : "$readmemb",
+				    rm.filename.c_str(), key.c_str());
+			}
+			initial_eval.readmem_calls.clear();
+		}
 	}
 
 	void handle(const ast::ProceduralBlockSymbol &symbol)

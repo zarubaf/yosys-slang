@@ -675,6 +675,38 @@ ER EvalVisitor::visit(const ExpressionStatement &stmt)
 					if (arg.bad())
 						return ER::Fail;
 				handleDisplay(call, args);
+			} else if (call.getSubroutineName() == "$readmemh" ||
+			           call.getSubroutineName() == "$readmemb") {
+				// Capture metadata only — file parsing happens at runtime in loomx.
+				auto args = call.arguments();
+				if (args.size() >= 2) {
+					auto filename_cv = args[0]->eval(context);
+					std::string filename;
+					// Slang constant-evaluates string literals as packed integers
+					if (filename_cv.isString()) {
+						filename = std::string(filename_cv.str());
+					} else if (filename_cv.isInteger()) {
+						auto &sv = filename_cv.integer();
+						int chars = (int)sv.getBitWidth() / 8;
+						for (int i = chars - 1; i >= 0; i--) {
+							uint8_t ch = 0;
+							for (int b = 0; b < 8; b++)
+								if ((bool)sv[i * 8 + b]) ch |= (uint8_t)(1 << b);
+							if (ch) filename += (char)ch;
+						}
+					}
+					// Unwrap Assignment/Conversion to find NamedValueExpression
+					const Expression *mem_arg = args[1];
+					while (mem_arg->kind == ExpressionKind::Assignment)
+						mem_arg = &mem_arg->as<AssignmentExpression>().left();
+					while (mem_arg->kind == ExpressionKind::Conversion)
+						mem_arg = &mem_arg->as<ConversionExpression>().operand();
+					if (!filename.empty() && mem_arg->kind == ExpressionKind::NamedValue) {
+						auto &sym = mem_arg->as<NamedValueExpression>().symbol;
+						readmem_calls.push_back({filename, &sym,
+							call.getSubroutineName() == "$readmemh"});
+					}
+				}
 			} else {
 				context.addDiag(slang::diag::ConstSysTaskIgnored, call.sourceRange)
 								<< call.getSubroutineName();

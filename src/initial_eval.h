@@ -18,6 +18,16 @@ public:
 	std::vector<InitialDpiCall> initial_dpi_calls;
 	bool capture_dpi_calls = false;  // set by frontend in loom mode
 
+	// Captured $readmemh/$readmemb metadata from initial blocks (for Loom).
+	// Only the filename and memory symbol are recorded — file parsing
+	// happens at runtime in loomx via the shadow port infrastructure.
+	struct ReadMemCall {
+		std::string filename;
+		const slang::ast::ValueSymbol *mem_symbol;  // memory variable symbol
+		bool is_hex;               // true = $readmemh, false = $readmemb
+	};
+	std::vector<ReadMemCall> readmem_calls;
+
 	using ER = slang::ast::Statement::EvalResult;
 
 	// for creating and initializing local variables
