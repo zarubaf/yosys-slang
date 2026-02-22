@@ -1321,6 +1321,8 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 						}
 						finish_cell->setParam(ID(EXIT_CODE), exit_code);
 						finish_cell->setParam(ID(IS_STOP), name == "$stop" ? 1 : 0);
+						// Side-effect cell: keep from opt_clean removal
+						finish_cell->set_bool_attribute(ID(keep), true);
 						// Set up trigger and enable like $check/$print cells
 						procedural->set_effects_trigger(finish_cell);
 					}
@@ -1344,6 +1346,8 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 					dpi_cell->set_string_attribute(ID(loom_dpi_func), std::string(subr.name));
 					// Mark as blackbox to skip internal cell checks
 					dpi_cell->set_bool_attribute(ID::blackbox, true);
+					// Side-effect cell: keep from opt_clean removal
+					dpi_cell->set_bool_attribute(ID(keep), true);
 
 					// Collect formal argument info from the subroutine declaration
 					auto formal_args = subr.getArguments();
