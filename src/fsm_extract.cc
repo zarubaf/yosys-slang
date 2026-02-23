@@ -604,6 +604,49 @@ void emit_multicycle_fsm(
 	StatementExecutor::SwitchHelper state_sw(
 		fsm_ctx.current_case, fsm_ctx.vstate, state_wire);
 
+	// Helper: emit a state transition to target_state. If the target is a
+	// pure conditional branch state (two complementary transitions, no
+	// actions, no counter ops), inline the branch to avoid an unnecessary
+	// extra clock-cycle boundary.
+	auto emit_state_next = [&](int target) {
+		auto &tgt = graph.states[target];
+		if (tgt.transitions.size() == 2) {
+			auto &bt0 = tgt.transitions[0];
+			auto &bt1 = tgt.transitions[1];
+			if (bt0.counter_load < 0 && bt0.counter_check < 0 && bt0.counter_dec < 0 &&
+			    bt1.counter_load < 0 && bt1.counter_check < 0 && bt1.counter_dec < 0 &&
+			    bt0.condition != nullptr && bt1.condition != nullptr &&
+			    bt0.condition == bt1.condition &&
+			    bt0.target_state >= 0 && bt1.target_state >= 0 &&
+			    bt0.target_state != target && bt1.target_state != target) {
+				RTLIL::SigSpec cond_sig = netlist.ReduceBool(
+					fsm_ctx.eval(*bt0.condition));
+				StatementExecutor::SwitchHelper branch_sw(
+					fsm_ctx.current_case, fsm_ctx.vstate, cond_sig);
+				RTLIL::SigSpec match0 = bt0.condition_polarity
+					? RTLIL::S1 : RTLIL::S0;
+				branch_sw.enter_branch({match0});
+				for (auto action : bt0.actions)
+					action->visit(StatementExecutor(fsm_ctx));
+				fsm_ctx.current_case->aux_actions.push_back(
+					RTLIL::SigSig(state_next,
+						RTLIL::Const(bt0.target_state, state_width)));
+				branch_sw.exit_branch();
+				branch_sw.enter_branch({});
+				for (auto action : bt1.actions)
+					action->visit(StatementExecutor(fsm_ctx));
+				fsm_ctx.current_case->aux_actions.push_back(
+					RTLIL::SigSig(state_next,
+						RTLIL::Const(bt1.target_state, state_width)));
+				branch_sw.exit_branch();
+				branch_sw.finish(netlist);
+				return;
+			}
+		}
+		fsm_ctx.current_case->aux_actions.push_back(
+			RTLIL::SigSig(state_next, RTLIL::Const(target, state_width)));
+	};
+
 	for (int si = 0; si < num_states; si++) {
 		auto &state = graph.states[si];
 		state_sw.enter_branch({RTLIL::Const(si, state_width)});
@@ -648,24 +691,19 @@ void emit_multicycle_fsm(
 					false, false, ctr_nxt->width);
 				fsm_ctx.current_case->aux_actions.push_back(
 					RTLIL::SigSig(ctr_nxt, dec_val));
-				fsm_ctx.current_case->aux_actions.push_back(
-					RTLIL::SigSig(state_next,
-						RTLIL::Const(tr.target_state, state_width)));
+				emit_state_next(tr.target_state);
 				bypass_sw.exit_branch();
 
 				bypass_sw.enter_branch({});
 				// Emit exit transition's actions (post-repeat statements)
 				for (auto action : exit_tr->actions)
 					action->visit(StatementExecutor(fsm_ctx));
-				fsm_ctx.current_case->aux_actions.push_back(
-					RTLIL::SigSig(state_next,
-						RTLIL::Const(exit_tr->target_state, state_width)));
+				emit_state_next(exit_tr->target_state);
 				bypass_sw.exit_branch();
 
 				bypass_sw.finish(netlist);
 			} else {
-				fsm_ctx.current_case->aux_actions.push_back(
-					RTLIL::SigSig(state_next, RTLIL::Const(tr.target_state, state_width)));
+				emit_state_next(tr.target_state);
 			}
 
 		} else if (state.transitions.size() == 2) {
@@ -733,18 +771,14 @@ void emit_multicycle_fsm(
 						false, false, ctr_nxt->width);
 					fsm_ctx.current_case->aux_actions.push_back(
 						RTLIL::SigSig(ctr_nxt, dec_val));
-					fsm_ctx.current_case->aux_actions.push_back(
-						RTLIL::SigSig(state_next,
-							RTLIL::Const(tr.target_state, state_width)));
+					emit_state_next(tr.target_state);
 					bypass_sw.exit_branch();
 
 					bypass_sw.enter_branch({});
 					// Emit exit transition's actions (post-repeat statements)
 					for (auto action : exit_tr->actions)
 						action->visit(StatementExecutor(fsm_ctx));
-					fsm_ctx.current_case->aux_actions.push_back(
-						RTLIL::SigSig(state_next,
-							RTLIL::Const(exit_tr->target_state, state_width)));
+					emit_state_next(exit_tr->target_state);
 					bypass_sw.exit_branch();
 
 					bypass_sw.finish(netlist);
@@ -758,9 +792,7 @@ void emit_multicycle_fsm(
 						fsm_ctx.current_case->aux_actions.push_back(
 							RTLIL::SigSig(ctr_nxt, dec));
 					}
-					fsm_ctx.current_case->aux_actions.push_back(
-						RTLIL::SigSig(state_next,
-							RTLIL::Const(tr.target_state, state_width)));
+					emit_state_next(tr.target_state);
 				}
 
 				cond_sw.exit_branch();
