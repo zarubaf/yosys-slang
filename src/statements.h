@@ -221,8 +221,21 @@ public:
 		cell->setParam(ID::ARGS_WIDTH, 0);
 		cell->setParam(ID::PRIORITY, --context.effects_priority);
 		cell->setPort(ID::ARGS, {});
-		cell->setPort(ID::A, netlist.ReduceBool(eval(statement.cond)));
+
+		RTLIL::SigSpec cond_sig = netlist.ReduceBool(eval(statement.cond));
+		cell->setPort(ID::A, cond_sig);
 		transfer_attrs(netlist, statement, cell);
+
+		// Visit else clause: any $display/$error/$fatal calls become
+		// $print cells conditioned on assertion failure (!cond).
+		if (statement.ifFalse) {
+			SwitchHelper b(context.current_case, context.vstate, cond_sig);
+			b.branch({RTLIL::S0}, [&]() {
+				statement.ifFalse->visit(*this);
+			});
+			b.finish(netlist);
+			context.current_case = context.current_case->add_switch({})->add_case({});
+		}
 	}
 
 	void handle(const ast::ConcurrentAssertionStatement &stmt)

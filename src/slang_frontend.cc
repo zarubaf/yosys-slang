@@ -924,7 +924,7 @@ void handle_display(ProceduralContext &context, const ast::CallExpression &call)
 	// TODO: insert the actual module name
 	fmt.parse_verilog(fmt_args, /* sformat_like */ false, /* default_base */ 10,
 					  std::string{call.getSubroutineName()}, netlist.canvas->name);
-	if (call.getSubroutineName() == "$display")
+	if (call.getSubroutineName() != "$write")
 		fmt.append_literal("\n");
 	fmt.emit_rtlil(cell);
 }
@@ -1293,7 +1293,10 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 		{
 			const auto &call = expr.as<ast::CallExpression>();
 			if (call.isSystemCall() && (call.getSubroutineName() == "$display"
-					|| call.getSubroutineName() == "$write")) {
+					|| call.getSubroutineName() == "$write"
+					|| call.getSubroutineName() == "$error"
+					|| call.getSubroutineName() == "$warning"
+					|| call.getSubroutineName() == "$info")) {
 				require(expr, procedural != nullptr);
 				handle_display(*procedural, call);
 			} else if (call.isSystemCall()) {
