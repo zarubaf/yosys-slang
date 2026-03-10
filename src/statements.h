@@ -10,6 +10,8 @@
 
 #include "cases.h"
 #include "slang/ast/ASTVisitor.h"
+#include "slang/ast/expressions/AssertionExpr.h"
+#include "slang/ast/TimingControl.h"
 #include "slang_frontend.h"
 #include "variables.h"
 
@@ -225,13 +227,107 @@ public:
 
 	void handle(const ast::ConcurrentAssertionStatement &stmt)
 	{
-		if (!netlist.settings.ignore_assertions.value_or(false)) {
-			if (stmt.assertionKind == ast::AssertionKind::Expect) {
-				netlist.add_diag(diag::ExpectStatementUnsupported, stmt.sourceRange);
+		if (netlist.settings.ignore_assertions.value_or(false))
+			return;
+
+		if (stmt.assertionKind == ast::AssertionKind::Expect) {
+			netlist.add_diag(diag::ExpectStatementUnsupported, stmt.sourceRange);
+			return;
+		}
+
+		// Only handle simple single-cycle properties:
+		//   assert property (@(posedge clk) disable iff (rst) expr)
+		// Reject anything with sequences, temporal operators, etc.
+		const ast::AssertionExpr *cur = &stmt.propertySpec;
+
+		// Step 1: Extract optional clocking (@(posedge clk))
+		const ast::SignalEventControl *clk_ctrl = nullptr;
+		if (cur->kind == ast::AssertionExprKind::Clocking) {
+			auto &clocking = cur->as<ast::ClockingAssertionExpr>();
+			if (clocking.clocking.kind == ast::TimingControlKind::SignalEvent) {
+				clk_ctrl = &clocking.clocking.as<ast::SignalEventControl>();
 			} else {
 				netlist.add_diag(diag::SVAUnsupported, stmt.sourceRange);
+				return;
 			}
+			cur = &clocking.expr;
 		}
+
+		// Step 2: Extract optional disable iff (rst)
+		const ast::Expression *disable_cond = nullptr;
+		if (cur->kind == ast::AssertionExprKind::DisableIff) {
+			auto &disable = cur->as<ast::DisableIffAssertionExpr>();
+			disable_cond = &disable.condition;
+			cur = &disable.expr;
+		}
+
+		// Step 3: Must be a simple expression (no sequences, temporal ops)
+		if (cur->kind != ast::AssertionExprKind::Simple) {
+			netlist.add_diag(diag::SVAUnsupported, stmt.sourceRange);
+			return;
+		}
+		auto &simple = cur->as<ast::SimpleAssertionExpr>();
+		if (simple.repetition.has_value()) {
+			netlist.add_diag(diag::SVAUnsupported, stmt.sourceRange);
+			return;
+		}
+
+		// Determine flavor
+		std::string flavor;
+		switch (stmt.assertionKind) {
+		case ast::AssertionKind::Assert:        flavor = "assert"; break;
+		case ast::AssertionKind::Assume:        flavor = "assume"; break;
+		case ast::AssertionKind::CoverProperty: flavor = "cover"; break;
+		default:                                netlist.add_diag(diag::SVAUnsupported, stmt.sourceRange); return;
+		}
+
+		// Cell name: use containing block label if available
+		RTLIL::IdString cell_name;
+		if (containing_block &&
+				unwrap_statement(containing_block->tryGetStatement()) == &stmt &&
+				!containing_block->name.empty()) {
+			cell_name = netlist.id(*containing_block);
+		} else {
+			cell_name = netlist.new_id();
+		}
+
+		auto cell = netlist.canvas->addCell(cell_name, ID($check));
+
+		// Evaluate the property condition
+		cell->setPort(ID::A, netlist.ReduceBool(eval(simple.expr)));
+
+		// Set up trigger from the extracted clock
+		if (clk_ctrl) {
+			RTLIL::SigSpec clk_sig = eval(clk_ctrl->expr);
+			cell->parameters[ID::TRG_ENABLE] = true;
+			cell->parameters[ID::TRG_WIDTH] = 1;
+			bool posedge = (clk_ctrl->edge == ast::EdgeKind::PosEdge ||
+			                clk_ctrl->edge == ast::EdgeKind::None);
+			cell->parameters[ID::TRG_POLARITY] = RTLIL::Const(posedge ? RTLIL::S1 : RTLIL::S0);
+			cell->setPort(ID::TRG, clk_sig);
+		} else {
+			// No clock — treat as combinational (implicit trigger)
+			cell->parameters[ID::TRG_ENABLE] = false;
+			cell->parameters[ID::TRG_WIDTH] = 0;
+			cell->parameters[ID::TRG_POLARITY] = {};
+			cell->setPort(ID::TRG, {});
+		}
+
+		// Enable: AND with disable_iff condition (inverted) and background enable
+		RTLIL::SigBit en = RTLIL::S1;
+		if (disable_cond) {
+			RTLIL::SigSpec disable_sig = netlist.ReduceBool(eval(*disable_cond));
+			en = netlist.LogicNot(disable_sig);
+		}
+		en = netlist.LogicAnd(context.timing.background_enable, en);
+		cell->setPort(ID::EN, en);
+
+		cell->setParam(ID::FLAVOR, flavor);
+		cell->setParam(ID::FORMAT, std::string(""));
+		cell->setParam(ID::ARGS_WIDTH, 0);
+		cell->setParam(ID::PRIORITY, --context.effects_priority);
+		cell->setPort(ID::ARGS, {});
+		transfer_attrs(netlist, stmt, cell);
 	}
 
 	RTLIL::SigSpec handle_call(const ast::CallExpression &call)
