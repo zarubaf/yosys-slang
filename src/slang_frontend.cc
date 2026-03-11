@@ -878,6 +878,70 @@ RTLIL::SigSpec handle_past(EvalContext &eval, const ast::CallExpression &call)
 	return past_wire;
 }
 
+RTLIL::SigSpec handle_rose(EvalContext &eval, const ast::CallExpression &call)
+{
+	NetlistContext &netlist = eval.netlist;
+	ProceduralContext *procedural = eval.procedural;
+
+	if (procedural == nullptr || procedural->timing.implicit() || procedural->timing.triggers.size() != 1) {
+		netlist.add_diag(diag::SystemFunctionRequireClockedBlock, call.sourceRange) << call.getSubroutineName();
+		return RTLIL::SigSpec(RTLIL::Sx, 1);
+	}
+
+	auto &trigger = procedural->timing.triggers[0];
+	RTLIL::SigSpec current = netlist.ReduceBool(eval(*call.arguments()[0]));
+
+	RTLIL::Wire *prev = netlist.canvas->addWire(netlist.new_id("$rose"), 1);
+	netlist.canvas->addDff(netlist.new_id("$rose"),
+		trigger.signal, current, prev, trigger.edge_polarity);
+
+	// $rose = current & !prev
+	return netlist.LogicAnd(current, netlist.LogicNot(prev));
+}
+
+RTLIL::SigSpec handle_fell(EvalContext &eval, const ast::CallExpression &call)
+{
+	NetlistContext &netlist = eval.netlist;
+	ProceduralContext *procedural = eval.procedural;
+
+	if (procedural == nullptr || procedural->timing.implicit() || procedural->timing.triggers.size() != 1) {
+		netlist.add_diag(diag::SystemFunctionRequireClockedBlock, call.sourceRange) << call.getSubroutineName();
+		return RTLIL::SigSpec(RTLIL::Sx, 1);
+	}
+
+	auto &trigger = procedural->timing.triggers[0];
+	RTLIL::SigSpec current = netlist.ReduceBool(eval(*call.arguments()[0]));
+
+	RTLIL::Wire *prev = netlist.canvas->addWire(netlist.new_id("$fell"), 1);
+	netlist.canvas->addDff(netlist.new_id("$fell"),
+		trigger.signal, current, prev, trigger.edge_polarity);
+
+	// $fell = !current & prev
+	return netlist.LogicAnd(netlist.LogicNot(current), prev);
+}
+
+RTLIL::SigSpec handle_stable(EvalContext &eval, const ast::CallExpression &call)
+{
+	NetlistContext &netlist = eval.netlist;
+	ProceduralContext *procedural = eval.procedural;
+
+	if (procedural == nullptr || procedural->timing.implicit() || procedural->timing.triggers.size() != 1) {
+		netlist.add_diag(diag::SystemFunctionRequireClockedBlock, call.sourceRange) << call.getSubroutineName();
+		return RTLIL::SigSpec(RTLIL::Sx, 1);
+	}
+
+	auto &trigger = procedural->timing.triggers[0];
+	RTLIL::SigSpec current = eval(*call.arguments()[0]);
+	int width = current.size();
+
+	RTLIL::Wire *prev = netlist.canvas->addWire(netlist.new_id("$stable"), width);
+	netlist.canvas->addDff(netlist.new_id("$stable"),
+		trigger.signal, current, prev, trigger.edge_polarity);
+
+	// $stable = (current == prev)
+	return netlist.Eq(current, prev);
+}
+
 void handle_display(ProceduralContext &context, const ast::CallExpression &call)
 {
 	NetlistContext &netlist = context.netlist;
@@ -1308,6 +1372,12 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 					ret = netlist.CountOnes(sig, (int)call.type->getBitstreamWidth());
 				} else if (name == "$past") {
 					ret = handle_past(*this, call);
+				} else if (name == "$rose") {
+					ret = handle_rose(*this, call);
+				} else if (name == "$fell") {
+					ret = handle_fell(*this, call);
+				} else if (name == "$stable") {
+					ret = handle_stable(*this, call);
 				} else if (name == "$finish" || name == "$stop") {
 					if (netlist.settings.loom.value_or(false)) {
 						// Create a $__loom_finish cell that will be transformed to hardware

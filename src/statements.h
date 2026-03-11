@@ -238,6 +238,147 @@ public:
 		}
 	}
 
+	// ----------------------------------------------------------------
+	// SVA sequence lowering helpers
+	// ----------------------------------------------------------------
+
+	// Create a chain of DFFs to delay a signal by N clock cycles.
+	RTLIL::SigSpec sva_delay_chain(RTLIL::SigSpec sig, int cycles,
+	                                RTLIL::SigSpec clk, bool clk_polarity,
+	                                bool zero_init = false)
+	{
+		RTLIL::SigSpec delayed = sig;
+		for (int i = 0; i < cycles; i++) {
+			RTLIL::Wire *w = netlist.canvas->addWire(
+				netlist.new_id("loom_sva_d"), sig.size());
+			if (zero_init)
+				w->attributes[ID::init] = RTLIL::Const(0, sig.size());
+			netlist.canvas->addDff(netlist.new_id("loom_sva_dff"),
+				clk, delayed, w, clk_polarity);
+			delayed = w;
+		}
+		return delayed;
+	}
+
+	struct SVAResult {
+		RTLIL::SigSpec check;  // 1-bit property check signal (high = holds)
+		int depth;             // max delay chain depth (for valid pipeline)
+		int span;              // total temporal span in cycles (for implications)
+	};
+
+	// Recursively lower an SVA assertion expression to checker RTL.
+	// Returns a 1-bit "property holds" signal and the pipeline depth.
+	SVAResult lower_sva_property(const ast::AssertionExpr &expr,
+	                              RTLIL::SigSpec clk, bool clk_pol,
+	                              slang::SourceRange sr)
+	{
+		switch (expr.kind) {
+		case ast::AssertionExprKind::Simple: {
+			auto &simple = expr.as<ast::SimpleAssertionExpr>();
+			if (simple.repetition.has_value()) {
+				netlist.add_diag(diag::SVAUnsupported, sr);
+				return {RTLIL::S1, 0, 0};
+			}
+			return {netlist.ReduceBool(eval(simple.expr)), 0, 0};
+		}
+
+		case ast::AssertionExprKind::SequenceConcat: {
+			auto &concat = expr.as<ast::SequenceConcatExpr>();
+			std::vector<RTLIL::SigSpec> elem_sigs;
+			std::vector<int> offsets;
+			int cumulative = 0;
+
+			for (size_t i = 0; i < concat.elements.size(); i++) {
+				auto &elem = concat.elements[i];
+
+				// Require bounded exact delay (reject unbounded/range)
+				if (!elem.delay.max.has_value() ||
+				    *elem.delay.max != elem.delay.min) {
+					netlist.add_diag(diag::SVAUnsupported, sr);
+					return {RTLIL::S1, 0, 0};
+				}
+
+				if (i == 0)
+					cumulative = (int)elem.delay.min;
+				else
+					cumulative += (int)elem.delay.min;
+				offsets.push_back(cumulative);
+
+				// Lower element recursively
+				auto result = lower_sva_property(*elem.sequence, clk, clk_pol, sr);
+				if (result.depth > 0) {
+					// Nested multi-cycle sequences not yet supported
+					netlist.add_diag(diag::SVAUnsupported, sr);
+					return {RTLIL::S1, 0, 0};
+				}
+				elem_sigs.push_back(result.check);
+			}
+
+			int last_offset = offsets.back();
+			int max_delay = 0;
+
+			// Build match signal: AND of all delayed elements
+			RTLIL::SigSpec match = RTLIL::S1;
+			for (size_t i = 0; i < concat.elements.size(); i++) {
+				int delay_cycles = last_offset - offsets[i];
+				if (delay_cycles > max_delay)
+					max_delay = delay_cycles;
+				RTLIL::SigSpec delayed = delay_cycles > 0
+					? sva_delay_chain(elem_sigs[i], delay_cycles, clk, clk_pol)
+					: elem_sigs[i];
+				match = netlist.LogicAnd(match, delayed);
+			}
+
+			return {match, max_delay, last_offset};
+		}
+
+		case ast::AssertionExprKind::SequenceWithMatch: {
+			auto &swm = expr.as<ast::SequenceWithMatchExpr>();
+			if (swm.repetition.has_value() || !swm.matchItems.empty()) {
+				netlist.add_diag(diag::SVAUnsupported, sr);
+				return {RTLIL::S1, 0, 0};
+			}
+			return lower_sva_property(swm.expr, clk, clk_pol, sr);
+		}
+
+		case ast::AssertionExprKind::Binary: {
+			auto &binary = expr.as<ast::BinaryAssertionExpr>();
+			if (binary.op == ast::BinaryAssertionOperator::OverlappedImplication ||
+			    binary.op == ast::BinaryAssertionOperator::NonOverlappedImplication) {
+				auto ante = lower_sva_property(binary.left, clk, clk_pol, sr);
+				auto cons = lower_sva_property(binary.right, clk, clk_pol, sr);
+
+				// Delay antecedent to align with consequent completion.
+				// Overlapping (|->): antecedent starts same cycle as consequent
+				// Non-overlapping (|=>): consequent starts 1 cycle after antecedent
+				int ante_delay = cons.span;
+				if (binary.op == ast::BinaryAssertionOperator::NonOverlappedImplication)
+					ante_delay += 1;
+
+				RTLIL::SigSpec ante_delayed = ante_delay > 0
+					? sva_delay_chain(ante.check, ante_delay, clk, clk_pol)
+					: ante.check;
+
+				// P = !ante_delayed | cons.check (vacuous pass when ante false)
+				RTLIL::SigSpec not_ante = netlist.LogicNot(ante_delayed);
+				RTLIL::SigSpec prop = netlist.LogicOr(not_ante, cons.check);
+
+				int total_depth = std::max(ante_delay + ante.depth, cons.depth);
+				return {prop, total_depth, 0};
+			}
+
+			netlist.add_diag(diag::SVAUnsupported, sr);
+			return {RTLIL::S1, 0, 0};
+		}
+
+		default:
+			netlist.add_diag(diag::SVAUnsupported, sr);
+			return {RTLIL::S1, 0, 0};
+		}
+	}
+
+	// ----------------------------------------------------------------
+
 	void handle(const ast::ConcurrentAssertionStatement &stmt)
 	{
 		if (netlist.settings.ignore_assertions.value_or(false))
@@ -248,9 +389,6 @@ public:
 			return;
 		}
 
-		// Only handle simple single-cycle properties:
-		//   assert property (@(posedge clk) disable iff (rst) expr)
-		// Reject anything with sequences, temporal operators, etc.
 		const ast::AssertionExpr *cur = &stmt.propertySpec;
 
 		// Step 1: Extract optional clocking (@(posedge clk))
@@ -274,13 +412,21 @@ public:
 			cur = &disable.expr;
 		}
 
-		// Step 3: Must be a simple expression (no sequences, temporal ops)
-		if (cur->kind != ast::AssertionExprKind::Simple) {
-			netlist.add_diag(diag::SVAUnsupported, stmt.sourceRange);
-			return;
+		// Step 3: Lower the assertion expression to checker RTL
+		RTLIL::SigSpec clk_sig;
+		bool clk_posedge = true;
+		if (clk_ctrl) {
+			clk_sig = eval(clk_ctrl->expr);
+			clk_posedge = (clk_ctrl->edge == ast::EdgeKind::PosEdge ||
+			               clk_ctrl->edge == ast::EdgeKind::None);
 		}
-		auto &simple = cur->as<ast::SimpleAssertionExpr>();
-		if (simple.repetition.has_value()) {
+
+		auto sva = lower_sva_property(*cur, clk_sig, clk_posedge, stmt.sourceRange);
+		RTLIL::SigSpec check_sig = sva.check;
+		int pipeline_depth = sva.depth;
+
+		// Multi-cycle sequences require a clock
+		if ((pipeline_depth > 0 || sva.span > 0) && !clk_ctrl) {
 			netlist.add_diag(diag::SVAUnsupported, stmt.sourceRange);
 			return;
 		}
@@ -305,21 +451,15 @@ public:
 		}
 
 		auto cell = netlist.canvas->addCell(cell_name, ID($check));
-
-		// Evaluate the property condition
-		cell->setPort(ID::A, netlist.ReduceBool(eval(simple.expr)));
+		cell->setPort(ID::A, check_sig);
 
 		// Set up trigger from the extracted clock
 		if (clk_ctrl) {
-			RTLIL::SigSpec clk_sig = eval(clk_ctrl->expr);
 			cell->parameters[ID::TRG_ENABLE] = true;
 			cell->parameters[ID::TRG_WIDTH] = 1;
-			bool posedge = (clk_ctrl->edge == ast::EdgeKind::PosEdge ||
-			                clk_ctrl->edge == ast::EdgeKind::None);
-			cell->parameters[ID::TRG_POLARITY] = RTLIL::Const(posedge ? RTLIL::S1 : RTLIL::S0);
+			cell->parameters[ID::TRG_POLARITY] = RTLIL::Const(clk_posedge ? RTLIL::S1 : RTLIL::S0);
 			cell->setPort(ID::TRG, clk_sig);
 		} else {
-			// No clock — treat as combinational (implicit trigger)
 			cell->parameters[ID::TRG_ENABLE] = false;
 			cell->parameters[ID::TRG_WIDTH] = 0;
 			cell->parameters[ID::TRG_POLARITY] = {};
@@ -333,6 +473,14 @@ public:
 			en = netlist.LogicNot(disable_sig);
 		}
 		en = netlist.LogicAnd(context.timing.background_enable, en);
+
+		// Gate enable with valid pipeline for multi-cycle sequences
+		if (pipeline_depth > 0) {
+			RTLIL::SigSpec valid = sva_delay_chain(RTLIL::S1, pipeline_depth,
+			                                        clk_sig, clk_posedge, /*zero_init=*/true);
+			en = netlist.LogicAnd(en, valid);
+		}
+
 		cell->setPort(ID::EN, en);
 
 		cell->setParam(ID::FLAVOR, flavor);
